@@ -1,5 +1,13 @@
 // Jenkinsfile: Let's Encrypt certificate issuance via certbot (DNS-01 / Route53), published to S3.
 //
+// Deliberately has NO `parameters {}` block. With "Pipeline script from SCM", Jenkins
+// re-syncs a job's build-parameter definitions from the Jenkinsfile on every run — so
+// any config you want to survive a `git pull` of this repo must live outside it, as
+// environment variables set directly on the Jenkins job or (recommended) its Folder:
+// Configure -> Properties -> Environment Variables. This file only ever reads them;
+// it never defines or defaults them, so your Jenkins-side config is never overwritten.
+// See README.md "Configuration" for the full variable list and setup steps.
+//
 // Every run forces a fresh issuance (--force-renewal) and overwrites fullchain.pem/privkey.pem
 // at the root of the target S3 bucket — no renewal-state tracking is needed, so certbot's
 // config/work/logs dirs just live under the workspace and are thrown away with it.
@@ -22,99 +30,49 @@ pipeline {
         buildDiscarder(logRotator(numToKeepStr: '30'))
     }
 
-    parameters {
-        choice(
-            name: 'DOMAIN_NAME',
-            choices: ['CUSTOM', 'example.com', 'www.example.com'],
-            description: 'Domain to request a certificate for. Leave on CUSTOM with CUSTOM_DOMAIN_NAME blank to use this job/folder\'s persistent CERTBOT_DEFAULT_DOMAIN env var (see README) — that is what unattended/cron-triggered builds will use.'
-        )
-        string(
-            name: 'CUSTOM_DOMAIN_NAME',
-            defaultValue: '',
-            description: 'Only used when DOMAIN_NAME = CUSTOM. Leave blank to fall back to the CERTBOT_DEFAULT_DOMAIN env var; fill in to override for one build.'
-        )
-        booleanParam(
-            name: 'INCLUDE_WILDCARD',
-            defaultValue: false,
-            description: 'Also request *.<domain> as a SAN alongside the base domain'
-        )
-        string(
-            name: 'HOSTED_ZONE_ID',
-            defaultValue: '',
-            description: 'Route53 hosted zone ID that contains the domain. Leave blank to fall back to the CERTBOT_DEFAULT_HOSTED_ZONE_ID env var; fill in to override for one build.'
-        )
-        string(
-            name: 'S3_BUCKET_NAME',
-            defaultValue: '',
-            description: 'S3 bucket fullchain.pem/privkey.pem are uploaded to (bucket root, overwritten every build). Leave blank to fall back to the CERTBOT_DEFAULT_S3_BUCKET env var; fill in to override for one build.'
-        )
-        string(
-            name: 'AWS_REGION',
-            defaultValue: 'us-east-1',
-            description: 'Region for S3/STS API calls (Route53 itself is global)'
-        )
-        string(
-            name: 'LETSENCRYPT_EMAIL',
-            defaultValue: '',
-            description: "Optional contact email for Let's Encrypt expiry/account notices. Leave blank to fall back to the CERTBOT_DEFAULT_EMAIL env var if set, otherwise registers without one (--register-unsafely-without-email)."
-        )
-        choice(
-            name: 'ACME_SERVER',
-            choices: ['production', 'staging'],
-            description: "Which ACME endpoint certbot talks to. Defaults to production; switch to 'staging' when testing changes to this pipeline to avoid Let's Encrypt production rate limits (5 duplicate certs/week per domain set)"
-        )
-        choice(
-            name: 'CERT_KEY_TYPE',
-            choices: ['rsa', 'ecdsa'],
-            description: 'Private key algorithm for the issued certificate: rsa (2048-bit) or ecdsa (secp384r1)'
-        )
-        string(
-            name: 'AWS_ACCESS_KEY_CRED_ID',
-            defaultValue: 'aws-certbot-access-key-id',
-            description: 'Jenkins "Secret text" credential ID holding the AWS access key ID'
-        )
-        string(
-            name: 'AWS_SECRET_KEY_CRED_ID',
-            defaultValue: 'aws-certbot-secret-access-key',
-            description: 'Jenkins "Secret text" credential ID holding the AWS secret access key'
-        )
-    }
-
     environment {
-        VENV_DIR           = "${WORKSPACE}/.venv"
-        CERTBOT_DIR        = "${WORKSPACE}/.certbot"
-        AWS_DEFAULT_REGION = "${params.AWS_REGION}"
+        VENV_DIR    = "${WORKSPACE}/.venv"
+        CERTBOT_DIR = "${WORKSPACE}/.certbot"
     }
 
     stages {
 
-        // Resolves each identity/location value as: explicit build parameter, else a
-        // CERTBOT_DEFAULT_* environment variable set at the Jenkins Folder or global level
-        // (outside this repo, so it survives Jenkinsfile updates and is what unattended/
-        // cron-triggered builds fall back to). See README "Persistent per-job config".
-        stage('Validate Parameters') {
+        // Reads this job's/Folder's CERTBOT_* environment variables, applies sane
+        // fallback defaults for the non-identity ones, and fails fast if a required
+        // identity variable (domain/zone/bucket) was never configured anywhere.
+        stage('Resolve & Validate Configuration') {
             steps {
                 script {
-                    env.DOMAIN = (params.DOMAIN_NAME == 'CUSTOM' ? params.CUSTOM_DOMAIN_NAME : params.DOMAIN_NAME)?.trim()
-                    if (!env.DOMAIN) { env.DOMAIN = env.CERTBOT_DEFAULT_DOMAIN?.trim() }
-
-                    env.HOSTED_ZONE_ID = params.HOSTED_ZONE_ID?.trim() ?: env.CERTBOT_DEFAULT_HOSTED_ZONE_ID?.trim()
-                    env.S3_BUCKET_NAME = params.S3_BUCKET_NAME?.trim() ?: env.CERTBOT_DEFAULT_S3_BUCKET?.trim()
-                    env.LETSENCRYPT_EMAIL = params.LETSENCRYPT_EMAIL?.trim() ?: (env.CERTBOT_DEFAULT_EMAIL?.trim() ?: '')
+                    env.DOMAIN             = env.CERTBOT_DOMAIN?.trim()
+                    env.HOSTED_ZONE_ID      = env.CERTBOT_HOSTED_ZONE_ID?.trim()
+                    env.S3_BUCKET_NAME      = env.CERTBOT_S3_BUCKET?.trim()
+                    env.INCLUDE_WILDCARD    = (env.CERTBOT_INCLUDE_WILDCARD?.trim() ?: 'false')
+                    env.AWS_DEFAULT_REGION  = (env.CERTBOT_AWS_REGION?.trim() ?: 'us-east-1')
+                    env.LETSENCRYPT_EMAIL   = (env.CERTBOT_EMAIL?.trim() ?: '')
+                    env.ACME_SERVER         = (env.CERTBOT_ACME_SERVER?.trim() ?: 'production')
+                    env.CERT_KEY_TYPE       = (env.CERTBOT_KEY_TYPE?.trim() ?: 'rsa')
+                    env.AWS_ACCESS_KEY_CRED_ID = (env.CERTBOT_AWS_ACCESS_KEY_CRED_ID?.trim() ?: 'aws-certbot-access-key-id')
+                    env.AWS_SECRET_KEY_CRED_ID = (env.CERTBOT_AWS_SECRET_KEY_CRED_ID?.trim() ?: 'aws-certbot-secret-access-key')
 
                     if (!env.DOMAIN) {
-                        error "No domain supplied: CUSTOM_DOMAIN_NAME was blank and no CERTBOT_DEFAULT_DOMAIN env var is set on this job/folder."
+                        error "CERTBOT_DOMAIN is not set on this job/Folder. Configure -> Properties -> Environment Variables."
                     }
                     if (!env.HOSTED_ZONE_ID) {
-                        error "No HOSTED_ZONE_ID supplied and no CERTBOT_DEFAULT_HOSTED_ZONE_ID env var is set on this job/folder."
+                        error "CERTBOT_HOSTED_ZONE_ID is not set on this job/Folder."
                     }
                     if (!env.S3_BUCKET_NAME) {
-                        error "No S3_BUCKET_NAME supplied and no CERTBOT_DEFAULT_S3_BUCKET env var is set on this job/folder."
+                        error "CERTBOT_S3_BUCKET is not set on this job/Folder."
+                    }
+                    if (!(env.ACME_SERVER in ['production', 'staging'])) {
+                        error "CERTBOT_ACME_SERVER must be 'production' or 'staging', got '${env.ACME_SERVER}'."
+                    }
+                    if (!(env.CERT_KEY_TYPE in ['rsa', 'ecdsa'])) {
+                        error "CERTBOT_KEY_TYPE must be 'rsa' or 'ecdsa', got '${env.CERT_KEY_TYPE}'."
                     }
 
-                    echo "Domain:       ${env.DOMAIN}${params.INCLUDE_WILDCARD ? ' (+ *.' + env.DOMAIN + ')' : ''}"
-                    echo "Key type:     ${params.CERT_KEY_TYPE}"
-                    echo "ACME server:  ${params.ACME_SERVER}"
+                    echo "Domain:       ${env.DOMAIN}${env.INCLUDE_WILDCARD == 'true' ? ' (+ *.' + env.DOMAIN + ')' : ''}"
+                    echo "Key type:     ${env.CERT_KEY_TYPE}"
+                    echo "ACME server:  ${env.ACME_SERVER}"
                     echo "Hosted zone:  ${env.HOSTED_ZONE_ID}"
                     echo "S3 target:    s3://${env.S3_BUCKET_NAME}/{fullchain,privkey}.pem"
                 }
@@ -148,8 +106,8 @@ pipeline {
         stage('Validate AWS Access') {
             steps {
                 withCredentials([
-                    string(credentialsId: params.AWS_ACCESS_KEY_CRED_ID, variable: 'AWS_ACCESS_KEY_ID'),
-                    string(credentialsId: params.AWS_SECRET_KEY_CRED_ID, variable: 'AWS_SECRET_ACCESS_KEY')
+                    string(credentialsId: env.AWS_ACCESS_KEY_CRED_ID, variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: env.AWS_SECRET_KEY_CRED_ID, variable: 'AWS_SECRET_ACCESS_KEY')
                 ]) {
                     sh '''
                         set -euo pipefail
@@ -164,8 +122,8 @@ pipeline {
         stage('Validate Route53 Permissions') {
             steps {
                 withCredentials([
-                    string(credentialsId: params.AWS_ACCESS_KEY_CRED_ID, variable: 'AWS_ACCESS_KEY_ID'),
-                    string(credentialsId: params.AWS_SECRET_KEY_CRED_ID, variable: 'AWS_SECRET_ACCESS_KEY')
+                    string(credentialsId: env.AWS_ACCESS_KEY_CRED_ID, variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: env.AWS_SECRET_KEY_CRED_ID, variable: 'AWS_SECRET_ACCESS_KEY')
                 ]) {
                     sh '''
                         set -euo pipefail
@@ -193,8 +151,8 @@ pipeline {
         stage('Validate S3 Permissions') {
             steps {
                 withCredentials([
-                    string(credentialsId: params.AWS_ACCESS_KEY_CRED_ID, variable: 'AWS_ACCESS_KEY_ID'),
-                    string(credentialsId: params.AWS_SECRET_KEY_CRED_ID, variable: 'AWS_SECRET_ACCESS_KEY')
+                    string(credentialsId: env.AWS_ACCESS_KEY_CRED_ID, variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: env.AWS_SECRET_KEY_CRED_ID, variable: 'AWS_SECRET_ACCESS_KEY')
                 ]) {
                     sh '''
                         set -euo pipefail
@@ -218,8 +176,8 @@ pipeline {
         stage('Request Certificate (certbot + Route53 DNS-01)') {
             steps {
                 withCredentials([
-                    string(credentialsId: params.AWS_ACCESS_KEY_CRED_ID, variable: 'AWS_ACCESS_KEY_ID'),
-                    string(credentialsId: params.AWS_SECRET_KEY_CRED_ID, variable: 'AWS_SECRET_ACCESS_KEY')
+                    string(credentialsId: env.AWS_ACCESS_KEY_CRED_ID, variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: env.AWS_SECRET_KEY_CRED_ID, variable: 'AWS_SECRET_ACCESS_KEY')
                 ]) {
                     sh '''
                         set -euo pipefail
@@ -272,8 +230,8 @@ pipeline {
         stage('Upload Certificate to S3') {
             steps {
                 withCredentials([
-                    string(credentialsId: params.AWS_ACCESS_KEY_CRED_ID, variable: 'AWS_ACCESS_KEY_ID'),
-                    string(credentialsId: params.AWS_SECRET_KEY_CRED_ID, variable: 'AWS_SECRET_ACCESS_KEY')
+                    string(credentialsId: env.AWS_ACCESS_KEY_CRED_ID, variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: env.AWS_SECRET_KEY_CRED_ID, variable: 'AWS_SECRET_ACCESS_KEY')
                 ]) {
                     sh '''
                         set -euo pipefail

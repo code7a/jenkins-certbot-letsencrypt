@@ -10,6 +10,29 @@ once the CA has validated the challenge. That's the "create and delete the
 challenge record" requirement, handled by well-tested upstream code instead of
 custom scripting.
 
+## Design: no build parameters, config lives in Jenkins itself
+
+This `Jenkinsfile` has **no `parameters {}` block**. That's deliberate: with
+"Pipeline script from SCM", Jenkins re-syncs a job's build-parameter
+definitions from the Jenkinsfile on *every single run* — so anything you'd
+set as a parameter default gets reset the moment this repo changes, and any
+value you typed into a previous build's form is just a UI convenience, not
+real persistence (a cron/webhook-triggered build never sees that form at
+all and always gets whatever the Jenkinsfile currently says).
+
+So instead, the split is:
+
+- **This repo / Jenkinsfile** = pipeline *logic* (stages, aws-cli + certbot
+  setup, validation checks, the actual certbot invocation). Push a fix here,
+  every job that points at this repo picks it up on its next run.
+- **Jenkins job/Folder configuration** = your actual *config* (which domain,
+  which bucket, which zone). Set once, directly in Jenkins, as plain
+  environment variables. Nothing in this repo ever touches them — `git pull`
+  can't overwrite Jenkins server state.
+
+The Jenkinsfile only ever *reads* `CERTBOT_*` environment variables; it never
+defines or defaults the identity ones. See "Configuration" below.
+
 ## Security posture — read this first
 
 **Nothing secret lives in this repo, the Jenkinsfile, or the CloudFormation
@@ -21,25 +44,26 @@ key ID and secret access key — are:
   CloudTrail-visible `describe-stacks` output, and
 - from there copied once into **Jenkins' own credential store** (section 2,
   step 4) as two `Secret text` credentials, referenced by ID (not value) from
-  the `Jenkinsfile` parameters.
+  the `Jenkinsfile`.
 
 Everything else in this repo (example bucket names, zone IDs, email
 addresses) is a non-sensitive placeholder you edit for your environment — if
 you add anything new, keep following that rule: secrets are a Jenkins
-credential ID or a Secrets Manager ARN, never a literal in a parameter
-`defaultValue`.
+credential ID or a Secrets Manager ARN, never a literal anywhere in this repo.
 
 ## 1. Jenkins prerequisites
 
 - **Credentials Binding plugin** — ships with Jenkins core almost everywhere;
   no extra install needed.
+- **Folders plugin** (`cloudbees-folder`) — bundled in nearly every Jenkins
+  install/plugin bundle already. Used to scope persistent config per domain.
 - A **Linux** agent with `python3` (with the `venv` module) and `bash`. No
   root required — `aws-cli` and `certbot` are installed into a throwaway
   virtualenv (`.venv/`) per workspace, not system-wide.
 - Outbound network access from the agent to `pypi.org` (tool install),
   AWS APIs, and Let's Encrypt's ACME endpoints (`acme-v02.api.letsencrypt.org`
-  and, when `ACME_SERVER=staging`, `acme-staging-v02.api.letsencrypt.org`).
-  If the agent sits behind a proxy/firewall, make sure those are allow-listed.
+  and, when staging, `acme-staging-v02.api.letsencrypt.org`). If the agent
+  sits behind a proxy/firewall, make sure those are allow-listed.
 
 ## 2. AWS setup — CloudFormation (recommended)
 
@@ -83,9 +107,9 @@ aws secretsmanager get-secret-value \
 4. In Jenkins, create two **Secret text** credentials from that output:
    - `aws-certbot-access-key-id` → the `AWS_ACCESS_KEY_ID` value
    - `aws-certbot-secret-access-key` → the `AWS_SECRET_ACCESS_KEY` value
-   (these IDs are the defaults for the `AWS_ACCESS_KEY_CRED_ID` /
-   `AWS_SECRET_KEY_CRED_ID` job parameters — change either side if you'd
-   rather use different credential IDs.)
+   (these IDs are the defaults the Jenkinsfile looks for — set
+   `CERTBOT_AWS_ACCESS_KEY_CRED_ID` / `CERTBOT_AWS_SECRET_KEY_CRED_ID` env
+   vars, per section 4, if you'd rather use different credential IDs.)
 
    For a hands-off alternative, install the **AWS Secrets Manager
    Credentials Provider** Jenkins plugin and point it at this secret — Jenkins
@@ -151,83 +175,65 @@ pipeline with `AccessDenied`.
 
 Use **"Pipeline script from SCM"** pointing at this repo, not a pasted-in
 script — that's what makes "push a Jenkinsfile fix, every job picks it up"
-work. On first run, Jenkins discovers the `parameters {}` block and exposes
-it as a normal "Build with Parameters" form (dropdown for `DOMAIN_NAME`,
-checkbox for wildcard, etc.) from the second build onward.
+work. There is no "Build with Parameters" form — since there are no declared
+parameters, "Build Now" just runs immediately using whatever's configured
+per section 4.
 
 Create one job **per domain** (e.g. `serviceslab-click-cert`), each inside
-its own Jenkins Folder — see the next section for why.
+its own Jenkins Folder — see section 4 for why.
 
-## 4. Persistent per-job config (so repo updates don't reset it)
+## 4. Configuration (persistent, set once per domain)
 
-The identity/location parameters — `DOMAIN_NAME`/`CUSTOM_DOMAIN_NAME`,
-`HOSTED_ZONE_ID`, `S3_BUCKET_NAME`, `LETSENCRYPT_EMAIL` — all default to
-**blank** in the Jenkinsfile on purpose. At the top of the pipeline, each one
-resolves as: *the build parameter if you filled it in, otherwise a
-`CERTBOT_DEFAULT_*` environment variable*. That variable is never set in the
-Jenkinsfile — you set it once, outside git, and it survives every future
-`git pull` of this repo:
+Every value the pipeline needs beyond pure logic is read from a `CERTBOT_*`
+environment variable. Set these directly on Jenkins — **never** in the
+Jenkinsfile — and they'll survive every future update to this repo:
 
-1. Install the **Folders plugin** if it isn't already (it ships by default
-   in most Jenkins installs/plugin bundles).
-2. Create a Folder for the domain, e.g. `serviceslab.click`, and put the
-   pipeline job inside it.
-3. On the Folder, open **Configure → Properties → Environment Variables**
-   and set:
-   - `CERTBOT_DEFAULT_DOMAIN=serviceslab.click`
-   - `CERTBOT_DEFAULT_HOSTED_ZONE_ID=Z02592813AQHMG0C14DBI`
-   - `CERTBOT_DEFAULT_S3_BUCKET=serviceslab.click.certificate`
-   - `CERTBOT_DEFAULT_EMAIL=` (optional)
-4. Leave `DOMAIN_NAME=CUSTOM`/`CUSTOM_DOMAIN_NAME`, `HOSTED_ZONE_ID`, and
-   `S3_BUCKET_NAME` blank on the build form — the folder's values fill in
-   automatically. Only type something into those fields when you want to
-   override just that one build.
+1. Create a Folder per domain, e.g. `serviceslab.click`, and put that
+   domain's pipeline job inside it.
+2. On the Folder, open **Configure → Properties → Environment Variables**
+   and set the variables below.
+3. Only one Jenkins instance / don't want Folders? Set the same variables at
+   **Manage Jenkins → System → Global properties → Environment variables**
+   instead — same effect, just shared across every job rather than scoped
+   per domain.
 
-This is what makes the difference between "repo updates propagate" and "my
-real config keeps getting reset": the Jenkinsfile (stages, certbot flags,
-AWS calls) is the thing git pushes change; the Folder's environment
-variables are the thing that doesn't move, because they're Jenkins server
-state, not repository content. It also matters for anything you later
-schedule with a cron trigger — a cron-triggered build never visits the
-"Build with Parameters" form, so it always runs with whatever's blank/default
-in the Jenkinsfile plus these folder fallbacks; it does **not** get Jenkins'
-separate (and easy to confuse with this) convenience behavior where a
-manually-triggered "Build with Parameters" page pre-fills with whatever you
-typed on your *previous* manual run.
+| Variable | Required | Default if unset | Purpose |
+|---|---|---|---|
+| `CERTBOT_DOMAIN` | **yes** | — (fails fast) | Domain to request a cert for, e.g. `serviceslab.click` |
+| `CERTBOT_HOSTED_ZONE_ID` | **yes** | — (fails fast) | Route53 zone ID containing that domain |
+| `CERTBOT_S3_BUCKET` | **yes** | — (fails fast) | Bucket `fullchain.pem`/`privkey.pem` are uploaded to (bucket root, overwritten every build) |
+| `CERTBOT_INCLUDE_WILDCARD` | no | `false` | Set `true` to also request `*.<domain>` as a SAN |
+| `CERTBOT_EMAIL` | no | *(blank)* | Expiry-notice address; blank → `--register-unsafely-without-email` |
+| `CERTBOT_AWS_REGION` | no | `us-east-1` | Region for S3/STS calls (Route53 API itself is global) |
+| `CERTBOT_ACME_SERVER` | no | `production` | `production` or `staging` — use staging while testing this pipeline |
+| `CERTBOT_KEY_TYPE` | no | `rsa` | `rsa` (2048-bit) or `ecdsa` (secp384r1) |
+| `CERTBOT_AWS_ACCESS_KEY_CRED_ID` | no | `aws-certbot-access-key-id` | Jenkins credential ID holding the AWS access key |
+| `CERTBOT_AWS_SECRET_KEY_CRED_ID` | no | `aws-certbot-secret-access-key` | Jenkins credential ID holding the AWS secret key |
 
-No Folder plugin, or only ever going to run one job on the whole instance?
-Set the same four variables at **Manage Jenkins → System → Global
-properties → Environment variables** instead — same effect, just shared
-across every job rather than scoped per domain.
+Example for the `serviceslab.click` Folder:
 
-`AWS_REGION`, `ACME_SERVER`, `CERT_KEY_TYPE`, and the two credential-ID
-parameters are left as plain Jenkinsfile defaults (no fallback plumbing) —
-they're pipeline behavior knobs, not per-domain identity, so it's fine for
-them to live in git and change when the file does.
+```
+CERTBOT_DOMAIN=serviceslab.click
+CERTBOT_HOSTED_ZONE_ID=Z02592813AQHMG0C14DBI
+CERTBOT_S3_BUCKET=serviceslab.click.certificate
+CERTBOT_INCLUDE_WILDCARD=true
+```
 
-## 5. Parameters
+**One-off override for a single build**: there's no parameter form to type
+into anymore — that's the whole point. To test something once (e.g. flip to
+`staging`), either temporarily edit the Folder/job environment variable and
+revert it after, or use Jenkins' **Replay** on a past build, which lets you
+edit the running script (including its effective `env`) for just that one
+run without touching the job config or this repo.
 
-| Parameter | Purpose |
-|---|---|
-| `DOMAIN_NAME` | `CUSTOM` (default) or a quick-pick from the dropdown |
-| `CUSTOM_DOMAIN_NAME` | Used when `DOMAIN_NAME=CUSTOM`. Blank → falls back to `CERTBOT_DEFAULT_DOMAIN` |
-| `INCLUDE_WILDCARD` | Also request `*.<domain>` as a SAN |
-| `HOSTED_ZONE_ID` | Route53 zone ID. Blank → falls back to `CERTBOT_DEFAULT_HOSTED_ZONE_ID` |
-| `S3_BUCKET_NAME` | Bucket `fullchain.pem`/`privkey.pem` are uploaded to (bucket root, overwritten every build). Blank → falls back to `CERTBOT_DEFAULT_S3_BUCKET` |
-| `AWS_REGION` | Region for S3/STS calls (Route53 API itself is global) |
-| `LETSENCRYPT_EMAIL` | Optional expiry-notice address. Blank → falls back to `CERTBOT_DEFAULT_EMAIL`, else `--register-unsafely-without-email` |
-| `ACME_SERVER` | `production` (default) or `staging` — **switch to staging while testing** |
-| `CERT_KEY_TYPE` | `rsa` (default, 2048-bit) or `ecdsa` (secp384r1) |
-| `AWS_ACCESS_KEY_CRED_ID` / `AWS_SECRET_KEY_CRED_ID` | Jenkins credential IDs from step 2 — point at the Secrets Manager values, never literal keys |
-
-## 6. Things worth knowing that weren't explicit in the ask
+## 5. Things worth knowing that weren't explicit in the ask
 
 - **Rate limits**: Let's Encrypt production allows 5 duplicate certificate
   requests per exact domain set per week, and 50 certs per registered domain
   per week. Every run passes `--force-renewal`, so each build consumes one of
   those slots regardless of how close the existing cert is to expiry.
-  `ACME_SERVER` defaults to `production`, so switch it to `staging` the first
-  few times you run or change this pipeline.
+  `CERTBOT_ACME_SERVER` defaults to `production`, so set it to `staging` the
+  first few times you run or change this pipeline.
 - **No persistent certbot state**: because every run forces a fresh issuance
   and S3 is simply overwritten, there's nothing to gain from preserving
   certbot's config/work dirs between builds — they live under the workspace
@@ -243,13 +249,12 @@ them to live in git and change when the file does.
   build artifacts are visible to anyone with job read access, which is the
   wrong place for key material.
 - **Domain/zone ownership check**: the `Validate Route53 Permissions` stage
-  confirms `DOMAIN_NAME` actually falls under `HOSTED_ZONE_ID` before
-  spending an ACME rate-limit slot on a request that would fail anyway.
+  confirms `CERTBOT_DOMAIN` actually falls under `CERTBOT_HOSTED_ZONE_ID`
+  before spending an ACME rate-limit slot on a request that would fail anyway.
 - **Timeout**: the whole pipeline is capped at 30 minutes in case DNS
   propagation or ACME validation hangs.
-- **Key type**: `CERT_KEY_TYPE` defaults to `rsa` (2048-bit); pick `ecdsa`
-  (secp384r1) if your downstream services prefer smaller/faster EC certs.
 - **Not included, consider separately**: a scheduled (`cron`) trigger to
-  re-run this monthly for renewal; Slack/email notification on failure or on
-  approaching expiry; multi-domain/SAN lists beyond the single wildcard
-  toggle.
+  re-run this monthly for renewal (this design makes cron-triggered renewal
+  safe, since there's no parameter form a scheduled build would miss);
+  Slack/email notification on failure or on approaching expiry; multi-domain/
+  SAN lists beyond the single wildcard toggle.
