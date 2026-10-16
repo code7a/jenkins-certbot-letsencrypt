@@ -1,0 +1,4 @@
+.venv/
+.certbot/
+*.pem
+*.log
