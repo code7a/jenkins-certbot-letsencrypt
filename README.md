@@ -43,8 +43,8 @@ key ID and secret access key — are:
   **AWS Secrets Manager**, never into a stack Output, the template, or
   CloudTrail-visible `describe-stacks` output, and
 - from there copied once into **Jenkins' own credential store** (section 2,
-  step 4) as two `Secret text` credentials, referenced by ID (not value) from
-  the `Jenkinsfile`.
+  step 4) as one `AWS Credentials` credential, referenced by ID (not value)
+  from the `Jenkinsfile`.
 
 Everything else in this repo (example bucket names, zone IDs, email
 addresses) is a non-sensitive placeholder you edit for your environment — if
@@ -53,8 +53,11 @@ credential ID or a Secrets Manager ARN, never a literal anywhere in this repo.
 
 ## 1. Jenkins prerequisites
 
-- **Credentials Binding plugin** — ships with Jenkins core almost everywhere;
-  no extra install needed.
+- **AWS Credentials plugin** (`aws-credentials`) — adds the "AWS Credentials"
+  credential kind this pipeline uses to bind `AWS_ACCESS_KEY_ID` /
+  `AWS_SECRET_ACCESS_KEY` from a single credential entry. Commonly already
+  installed; if "AWS Credentials" isn't an option in Jenkins' Add Credentials
+  dialog, install it from Manage Jenkins → Plugins.
 - **Folders plugin** (`cloudbees-folder`) — bundled in nearly every Jenkins
   install/plugin bundle already. Used to scope persistent config per domain.
 - A **Linux** agent with `python3` (with the `venv` module) and `bash`. No
@@ -104,12 +107,12 @@ aws secretsmanager get-secret-value \
   --query SecretString --output text
 ```
 
-4. In Jenkins, create two **Secret text** credentials from that output:
-   - `aws-certbot-access-key-id` → the `AWS_ACCESS_KEY_ID` value
-   - `aws-certbot-secret-access-key` → the `AWS_SECRET_ACCESS_KEY` value
-   (these IDs are the defaults the Jenkinsfile looks for — set
-   `CERTBOT_AWS_ACCESS_KEY_CRED_ID` / `CERTBOT_AWS_SECRET_KEY_CRED_ID` env
-   vars, per section 4, if you'd rather use different credential IDs.)
+4. In Jenkins, **Add Credentials** → Kind: **AWS Credentials** → paste the
+   `AWS_ACCESS_KEY_ID` value into "Access Key ID" and `AWS_SECRET_ACCESS_KEY`
+   into "Secret Access Key" → set **ID: `aws-certbot-access-key-id`** (this
+   exact ID is the default the Jenkinsfile looks for — set a
+   `CERTBOT_AWS_CRED_ID` env var, per section 4, if you'd rather use a
+   different ID).
 
    For a hands-off alternative, install the **AWS Secrets Manager
    Credentials Provider** Jenkins plugin and point it at this secret — Jenkins
@@ -132,7 +135,7 @@ If you'd rather not use CloudFormation, do it by hand:
 2. Attach a policy based on `iam-policy.json` in this repo, after replacing
    `YOUR_HOSTED_ZONE_ID` and `YOUR_BUCKET_NAME` with your real values.
 3. Generate an access key for that user (`aws iam create-access-key`).
-4. Create the same two Jenkins `Secret text` credentials described above.
+4. Create the same Jenkins `AWS Credentials` credential described above.
 
 Either way, the policy grants exactly:
 - `route53:ListHostedZones`, `route53:ListHostedZonesByName` (account-wide —
@@ -207,8 +210,7 @@ Jenkinsfile — and they'll survive every future update to this repo:
 | `CERTBOT_AWS_REGION` | no | `us-east-1` | Region for S3/STS calls (Route53 API itself is global) |
 | `CERTBOT_ACME_SERVER` | no | `production` | `production` or `staging` — use staging while testing this pipeline |
 | `CERTBOT_KEY_TYPE` | no | `rsa` | `rsa` (2048-bit) or `ecdsa` (secp384r1) |
-| `CERTBOT_AWS_ACCESS_KEY_CRED_ID` | no | `aws-certbot-access-key-id` | Jenkins credential ID holding the AWS access key |
-| `CERTBOT_AWS_SECRET_KEY_CRED_ID` | no | `aws-certbot-secret-access-key` | Jenkins credential ID holding the AWS secret key |
+| `CERTBOT_AWS_CRED_ID` | no | `aws-certbot-access-key-id` | Jenkins credential ID of the **AWS Credentials**-kind entry holding both the access key and secret key |
 
 Example for the `serviceslab.click` Folder:
 

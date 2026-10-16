@@ -15,9 +15,9 @@
 // Requires on the agent: python3 + venv module, bash. No root required — aws-cli and
 // certbot are installed into a local virtualenv under the workspace.
 //
-// Requires in Jenkins: Credentials Binding plugin (core, almost always present) and two
-// "Secret text" credentials holding an IAM user's access key id / secret access key. That
-// IAM user needs the policy in iam-policy.json attached — an access key alone grants no
+// Requires in Jenkins: the AWS Credentials plugin (credential kind "AWS Credentials") and
+// one such credential holding an IAM user's access key id + secret access key. That IAM
+// user needs the policy in iam-policy.json attached — an access key alone grants no
 // permissions; see README.md.
 
 pipeline {
@@ -51,8 +51,7 @@ pipeline {
                     env.LETSENCRYPT_EMAIL   = (env.CERTBOT_EMAIL?.trim() ?: '')
                     env.ACME_SERVER         = (env.CERTBOT_ACME_SERVER?.trim() ?: 'production')
                     env.CERT_KEY_TYPE       = (env.CERTBOT_KEY_TYPE?.trim() ?: 'rsa')
-                    env.AWS_ACCESS_KEY_CRED_ID = (env.CERTBOT_AWS_ACCESS_KEY_CRED_ID?.trim() ?: 'aws-certbot-access-key-id')
-                    env.AWS_SECRET_KEY_CRED_ID = (env.CERTBOT_AWS_SECRET_KEY_CRED_ID?.trim() ?: 'aws-certbot-secret-access-key')
+                    env.AWS_CRED_ID = (env.CERTBOT_AWS_CRED_ID?.trim() ?: 'aws-certbot-access-key-id')
 
                     if (!env.DOMAIN) {
                         error "CERTBOT_DOMAIN is not set on this job/Folder. Configure -> Properties -> Environment Variables."
@@ -105,10 +104,12 @@ pipeline {
 
         stage('Validate AWS Access') {
             steps {
-                withCredentials([
-                    string(credentialsId: env.AWS_ACCESS_KEY_CRED_ID, variable: 'AWS_ACCESS_KEY_ID'),
-                    string(credentialsId: env.AWS_SECRET_KEY_CRED_ID, variable: 'AWS_SECRET_ACCESS_KEY')
-                ]) {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: env.AWS_CRED_ID,
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
                     sh '''
                         set -euo pipefail
                         . "${VENV_DIR}/bin/activate"
@@ -121,10 +122,12 @@ pipeline {
 
         stage('Validate Route53 Permissions') {
             steps {
-                withCredentials([
-                    string(credentialsId: env.AWS_ACCESS_KEY_CRED_ID, variable: 'AWS_ACCESS_KEY_ID'),
-                    string(credentialsId: env.AWS_SECRET_KEY_CRED_ID, variable: 'AWS_SECRET_ACCESS_KEY')
-                ]) {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: env.AWS_CRED_ID,
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
                     sh '''
                         set -euo pipefail
                         . "${VENV_DIR}/bin/activate"
@@ -150,10 +153,12 @@ pipeline {
 
         stage('Validate S3 Permissions') {
             steps {
-                withCredentials([
-                    string(credentialsId: env.AWS_ACCESS_KEY_CRED_ID, variable: 'AWS_ACCESS_KEY_ID'),
-                    string(credentialsId: env.AWS_SECRET_KEY_CRED_ID, variable: 'AWS_SECRET_ACCESS_KEY')
-                ]) {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: env.AWS_CRED_ID,
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
                     sh '''
                         set -euo pipefail
                         . "${VENV_DIR}/bin/activate"
@@ -175,10 +180,12 @@ pipeline {
 
         stage('Request Certificate (certbot + Route53 DNS-01)') {
             steps {
-                withCredentials([
-                    string(credentialsId: env.AWS_ACCESS_KEY_CRED_ID, variable: 'AWS_ACCESS_KEY_ID'),
-                    string(credentialsId: env.AWS_SECRET_KEY_CRED_ID, variable: 'AWS_SECRET_ACCESS_KEY')
-                ]) {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: env.AWS_CRED_ID,
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
                     sh '''
                         set -euo pipefail
                         . "${VENV_DIR}/bin/activate"
@@ -229,10 +236,12 @@ pipeline {
 
         stage('Upload Certificate to S3') {
             steps {
-                withCredentials([
-                    string(credentialsId: env.AWS_ACCESS_KEY_CRED_ID, variable: 'AWS_ACCESS_KEY_ID'),
-                    string(credentialsId: env.AWS_SECRET_KEY_CRED_ID, variable: 'AWS_SECRET_ACCESS_KEY')
-                ]) {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: env.AWS_CRED_ID,
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
                     sh '''
                         set -euo pipefail
                         . "${VENV_DIR}/bin/activate"
