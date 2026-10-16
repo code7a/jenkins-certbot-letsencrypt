@@ -124,62 +124,117 @@ Either way, the policy grants exactly:
 
 Deliberately **no** `s3:DeleteObject` is granted, per the brief's least-
 privilege ask. The pipeline's S3 permission check (`Validate S3 Permissions`
-stage) writes a small marker object under `<prefix>/_healthcheck/` every
-build and never deletes it — the CloudFormation stack's bucket already has a
-lifecycle rule to expire that prefix after 1 day; if you created the bucket
-by hand, add the same rule yourself:
+stage) writes a small marker object under `_healthcheck/` every build and
+never deletes it — the CloudFormation stack's bucket already has a lifecycle
+rule to expire that prefix after 1 day; if you created the bucket by hand,
+add the same rule yourself:
 
 ```json
 {
   "Rules": [{
     "ID": "expire-jenkins-certbot-healthchecks",
-    "Filter": { "Prefix": "certificates/_healthcheck/" },
+    "Filter": { "Prefix": "_healthcheck/" },
     "Status": "Enabled",
     "Expiration": { "Days": 1 }
   }]
 }
 ```
 
+**An access key by itself grants nothing.** Whether you use the
+CloudFormation stack or do it by hand, the IAM *user* must have the policy
+above attached before its keys can do anything — Jenkins has no say over AWS
+permissions, it just uses whatever the credentials you give it allow. A bare
+user with keys and no attached policy will fail every `aws` call in the
+pipeline with `AccessDenied`.
+
 ## 3. Create the pipeline job
 
-Create a Pipeline job pointing at this repo (or paste `Jenkinsfile` directly
-into a Pipeline script). On first run, Jenkins will discover the `parameters {}`
-block and expose it as a normal "Build with Parameters" form (dropdown for
-`DOMAIN_NAME`, checkbox for wildcard, etc.) from the second build onward.
+Use **"Pipeline script from SCM"** pointing at this repo, not a pasted-in
+script — that's what makes "push a Jenkinsfile fix, every job picks it up"
+work. On first run, Jenkins discovers the `parameters {}` block and exposes
+it as a normal "Build with Parameters" form (dropdown for `DOMAIN_NAME`,
+checkbox for wildcard, etc.) from the second build onward.
 
-## 4. Parameters
+Create one job **per domain** (e.g. `serviceslab-click-cert`), each inside
+its own Jenkins Folder — see the next section for why.
+
+## 4. Persistent per-job config (so repo updates don't reset it)
+
+The identity/location parameters — `DOMAIN_NAME`/`CUSTOM_DOMAIN_NAME`,
+`HOSTED_ZONE_ID`, `S3_BUCKET_NAME`, `LETSENCRYPT_EMAIL` — all default to
+**blank** in the Jenkinsfile on purpose. At the top of the pipeline, each one
+resolves as: *the build parameter if you filled it in, otherwise a
+`CERTBOT_DEFAULT_*` environment variable*. That variable is never set in the
+Jenkinsfile — you set it once, outside git, and it survives every future
+`git pull` of this repo:
+
+1. Install the **Folders plugin** if it isn't already (it ships by default
+   in most Jenkins installs/plugin bundles).
+2. Create a Folder for the domain, e.g. `serviceslab.click`, and put the
+   pipeline job inside it.
+3. On the Folder, open **Configure → Properties → Environment Variables**
+   and set:
+   - `CERTBOT_DEFAULT_DOMAIN=serviceslab.click`
+   - `CERTBOT_DEFAULT_HOSTED_ZONE_ID=Z02592813AQHMG0C14DBI`
+   - `CERTBOT_DEFAULT_S3_BUCKET=serviceslab.click.certificate`
+   - `CERTBOT_DEFAULT_EMAIL=` (optional)
+4. Leave `DOMAIN_NAME=CUSTOM`/`CUSTOM_DOMAIN_NAME`, `HOSTED_ZONE_ID`, and
+   `S3_BUCKET_NAME` blank on the build form — the folder's values fill in
+   automatically. Only type something into those fields when you want to
+   override just that one build.
+
+This is what makes the difference between "repo updates propagate" and "my
+real config keeps getting reset": the Jenkinsfile (stages, certbot flags,
+AWS calls) is the thing git pushes change; the Folder's environment
+variables are the thing that doesn't move, because they're Jenkins server
+state, not repository content. It also matters for anything you later
+schedule with a cron trigger — a cron-triggered build never visits the
+"Build with Parameters" form, so it always runs with whatever's blank/default
+in the Jenkinsfile plus these folder fallbacks; it does **not** get Jenkins'
+separate (and easy to confuse with this) convenience behavior where a
+manually-triggered "Build with Parameters" page pre-fills with whatever you
+typed on your *previous* manual run.
+
+No Folder plugin, or only ever going to run one job on the whole instance?
+Set the same four variables at **Manage Jenkins → System → Global
+properties → Environment variables** instead — same effect, just shared
+across every job rather than scoped per domain.
+
+`AWS_REGION`, `ACME_SERVER`, `CERT_KEY_TYPE`, and the two credential-ID
+parameters are left as plain Jenkinsfile defaults (no fallback plumbing) —
+they're pipeline behavior knobs, not per-domain identity, so it's fine for
+them to live in git and change when the file does.
+
+## 5. Parameters
 
 | Parameter | Purpose |
 |---|---|
-| `DOMAIN_NAME` | Dropdown of pre-set domains, or `CUSTOM` |
-| `CUSTOM_DOMAIN_NAME` | Free-text domain, only read when `DOMAIN_NAME=CUSTOM` |
+| `DOMAIN_NAME` | `CUSTOM` (default) or a quick-pick from the dropdown |
+| `CUSTOM_DOMAIN_NAME` | Used when `DOMAIN_NAME=CUSTOM`. Blank → falls back to `CERTBOT_DEFAULT_DOMAIN` |
 | `INCLUDE_WILDCARD` | Also request `*.<domain>` as a SAN |
-| `HOSTED_ZONE_ID` | Route53 zone ID containing the domain (validated before certbot runs) |
-| `S3_BUCKET_NAME` / `S3_PREFIX` | Where issued certs are uploaded |
+| `HOSTED_ZONE_ID` | Route53 zone ID. Blank → falls back to `CERTBOT_DEFAULT_HOSTED_ZONE_ID` |
+| `S3_BUCKET_NAME` | Bucket `fullchain.pem`/`privkey.pem` are uploaded to (bucket root, overwritten every build). Blank → falls back to `CERTBOT_DEFAULT_S3_BUCKET` |
 | `AWS_REGION` | Region for S3/STS calls (Route53 API itself is global) |
-| `LETSENCRYPT_EMAIL` | Registration + expiry-notice address |
+| `LETSENCRYPT_EMAIL` | Optional expiry-notice address. Blank → falls back to `CERTBOT_DEFAULT_EMAIL`, else `--register-unsafely-without-email` |
 | `ACME_SERVER` | `production` (default) or `staging` — **switch to staging while testing** |
 | `CERT_KEY_TYPE` | `rsa` (default, 2048-bit) or `ecdsa` (secp384r1) |
 | `AWS_ACCESS_KEY_CRED_ID` / `AWS_SECRET_KEY_CRED_ID` | Jenkins credential IDs from step 2 — point at the Secrets Manager values, never literal keys |
-| `CERTBOT_BASE_DIR` | Optional absolute host path to persist certbot state across builds (see below) |
 
-Edit the `choices` list for `DOMAIN_NAME` and the various `defaultValue`s in
-the `Jenkinsfile` to match your real domains/bucket/zone before running.
-
-## 5. Things worth knowing that weren't explicit in the ask
+## 6. Things worth knowing that weren't explicit in the ask
 
 - **Rate limits**: Let's Encrypt production allows 5 duplicate certificate
   requests per exact domain set per week, and 50 certs per registered domain
-  per week. `ACME_SERVER` defaults to `production`, so switch it to `staging`
-  the first few times you run or change this pipeline.
-- **State persistence / renewal**: certbot tracks its account registration
-  and renewal config under its config dir. By default this pipeline keeps
-  that under the job workspace (`.certbot/`), which is fine for one-shot
-  issuance but may be wiped by workspace cleanup between builds. Set
-  `CERTBOT_BASE_DIR` to a stable path on the agent (e.g.
-  `/var/lib/jenkins-certbot`) if you want certbot to recognize this as a
-  renewal of a cert it already issued rather than a brand-new request every
-  time.
+  per week. Every run passes `--force-renewal`, so each build consumes one of
+  those slots regardless of how close the existing cert is to expiry.
+  `ACME_SERVER` defaults to `production`, so switch it to `staging` the first
+  few times you run or change this pipeline.
+- **No persistent certbot state**: because every run forces a fresh issuance
+  and S3 is simply overwritten, there's nothing to gain from preserving
+  certbot's config/work dirs between builds — they live under the workspace
+  (`.certbot/`) and are discarded with it. If you later want certbot's
+  incremental `renew` behavior instead of `--force-renewal` every time, you'd
+  need to point `--config-dir`/`--work-dir` at a path that survives outside
+  the workspace.
 - **Concurrency**: `disableConcurrentBuilds()` is set so two builds can't
   race to create/delete the same `_acme-challenge` TXT record.
 - **Private key handling**: the private key is uploaded to S3 with

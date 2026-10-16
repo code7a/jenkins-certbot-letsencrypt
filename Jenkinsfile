@@ -1,11 +1,16 @@
 // Jenkinsfile: Let's Encrypt certificate issuance via certbot (DNS-01 / Route53), published to S3.
 //
+// Every run forces a fresh issuance (--force-renewal) and overwrites fullchain.pem/privkey.pem
+// at the root of the target S3 bucket — no renewal-state tracking is needed, so certbot's
+// config/work/logs dirs just live under the workspace and are thrown away with it.
+//
 // Requires on the agent: python3 + venv module, bash. No root required — aws-cli and
-// certbot are installed into a local virtualenv under the workspace (or CERTBOT_BASE_DIR).
+// certbot are installed into a local virtualenv under the workspace.
 //
 // Requires in Jenkins: Credentials Binding plugin (core, almost always present) and two
-// "Secret text" credentials holding an IAM user's access key id / secret access key.
-// See README.md for the IAM policy and credential setup.
+// "Secret text" credentials holding an IAM user's access key id / secret access key. That
+// IAM user needs the policy in iam-policy.json attached — an access key alone grants no
+// permissions; see README.md.
 
 pipeline {
     agent any
@@ -20,13 +25,13 @@ pipeline {
     parameters {
         choice(
             name: 'DOMAIN_NAME',
-            choices: ['example.com', 'www.example.com', 'CUSTOM'],
-            description: 'Domain to request a certificate for. Edit this list to your real domains. Pick CUSTOM to type an arbitrary one below.'
+            choices: ['CUSTOM', 'example.com', 'www.example.com'],
+            description: 'Domain to request a certificate for. Leave on CUSTOM with CUSTOM_DOMAIN_NAME blank to use this job/folder\'s persistent CERTBOT_DEFAULT_DOMAIN env var (see README) — that is what unattended/cron-triggered builds will use.'
         )
         string(
             name: 'CUSTOM_DOMAIN_NAME',
             defaultValue: '',
-            description: 'Only used when DOMAIN_NAME = CUSTOM, e.g. api.example.com'
+            description: 'Only used when DOMAIN_NAME = CUSTOM. Leave blank to fall back to the CERTBOT_DEFAULT_DOMAIN env var; fill in to override for one build.'
         )
         booleanParam(
             name: 'INCLUDE_WILDCARD',
@@ -35,18 +40,13 @@ pipeline {
         )
         string(
             name: 'HOSTED_ZONE_ID',
-            defaultValue: 'Z0123456789ABCDEFGHIJ',
-            description: 'Route53 hosted zone ID that contains DOMAIN_NAME (used to validate permissions/ownership before certbot runs)'
+            defaultValue: '',
+            description: 'Route53 hosted zone ID that contains the domain. Leave blank to fall back to the CERTBOT_DEFAULT_HOSTED_ZONE_ID env var; fill in to override for one build.'
         )
         string(
             name: 'S3_BUCKET_NAME',
-            defaultValue: 'my-certbot-cert-bucket',
-            description: 'S3 bucket the issued certificate files are uploaded to'
-        )
-        string(
-            name: 'S3_PREFIX',
-            defaultValue: 'certificates',
-            description: 'Key prefix inside the bucket; certs land at <prefix>/<domain>/'
+            defaultValue: '',
+            description: 'S3 bucket fullchain.pem/privkey.pem are uploaded to (bucket root, overwritten every build). Leave blank to fall back to the CERTBOT_DEFAULT_S3_BUCKET env var; fill in to override for one build.'
         )
         string(
             name: 'AWS_REGION',
@@ -55,8 +55,8 @@ pipeline {
         )
         string(
             name: 'LETSENCRYPT_EMAIL',
-            defaultValue: 'ops@example.com',
-            description: "Registration/expiry-notice email passed to certbot"
+            defaultValue: '',
+            description: "Optional contact email for Let's Encrypt expiry/account notices. Leave blank to fall back to the CERTBOT_DEFAULT_EMAIL env var if set, otherwise registers without one (--register-unsafely-without-email)."
         )
         choice(
             name: 'ACME_SERVER',
@@ -78,37 +78,45 @@ pipeline {
             defaultValue: 'aws-certbot-secret-access-key',
             description: 'Jenkins "Secret text" credential ID holding the AWS secret access key'
         )
-        string(
-            name: 'CERTBOT_BASE_DIR',
-            defaultValue: '',
-            description: 'Optional: absolute path on the agent to persist certbot state (account registration, renewal history) across builds, e.g. /var/lib/jenkins-certbot. Leave blank to use the workspace (state will NOT survive workspace wipes).'
-        )
     }
 
     environment {
         VENV_DIR           = "${WORKSPACE}/.venv"
-        CERTBOT_DIR        = "${params.CERTBOT_BASE_DIR.trim() ? params.CERTBOT_BASE_DIR + '/' + env.JOB_NAME : WORKSPACE + '/.certbot'}"
-        DOMAIN             = "${params.DOMAIN_NAME == 'CUSTOM' ? params.CUSTOM_DOMAIN_NAME.trim() : params.DOMAIN_NAME}"
+        CERTBOT_DIR        = "${WORKSPACE}/.certbot"
         AWS_DEFAULT_REGION = "${params.AWS_REGION}"
     }
 
     stages {
 
+        // Resolves each identity/location value as: explicit build parameter, else a
+        // CERTBOT_DEFAULT_* environment variable set at the Jenkins Folder or global level
+        // (outside this repo, so it survives Jenkinsfile updates and is what unattended/
+        // cron-triggered builds fall back to). See README "Persistent per-job config".
         stage('Validate Parameters') {
             steps {
                 script {
-                    if (!env.DOMAIN?.trim()) {
-                        error "DOMAIN_NAME is CUSTOM but CUSTOM_DOMAIN_NAME was left blank."
+                    env.DOMAIN = (params.DOMAIN_NAME == 'CUSTOM' ? params.CUSTOM_DOMAIN_NAME : params.DOMAIN_NAME)?.trim()
+                    if (!env.DOMAIN) { env.DOMAIN = env.CERTBOT_DEFAULT_DOMAIN?.trim() }
+
+                    env.HOSTED_ZONE_ID = params.HOSTED_ZONE_ID?.trim() ?: env.CERTBOT_DEFAULT_HOSTED_ZONE_ID?.trim()
+                    env.S3_BUCKET_NAME = params.S3_BUCKET_NAME?.trim() ?: env.CERTBOT_DEFAULT_S3_BUCKET?.trim()
+                    env.LETSENCRYPT_EMAIL = params.LETSENCRYPT_EMAIL?.trim() ?: (env.CERTBOT_DEFAULT_EMAIL?.trim() ?: '')
+
+                    if (!env.DOMAIN) {
+                        error "No domain supplied: CUSTOM_DOMAIN_NAME was blank and no CERTBOT_DEFAULT_DOMAIN env var is set on this job/folder."
                     }
-                    if (!params.HOSTED_ZONE_ID?.trim() || !params.S3_BUCKET_NAME?.trim()) {
-                        error "HOSTED_ZONE_ID and S3_BUCKET_NAME are required."
+                    if (!env.HOSTED_ZONE_ID) {
+                        error "No HOSTED_ZONE_ID supplied and no CERTBOT_DEFAULT_HOSTED_ZONE_ID env var is set on this job/folder."
                     }
+                    if (!env.S3_BUCKET_NAME) {
+                        error "No S3_BUCKET_NAME supplied and no CERTBOT_DEFAULT_S3_BUCKET env var is set on this job/folder."
+                    }
+
                     echo "Domain:       ${env.DOMAIN}${params.INCLUDE_WILDCARD ? ' (+ *.' + env.DOMAIN + ')' : ''}"
                     echo "Key type:     ${params.CERT_KEY_TYPE}"
                     echo "ACME server:  ${params.ACME_SERVER}"
-                    echo "Hosted zone:  ${params.HOSTED_ZONE_ID}"
-                    echo "S3 target:    s3://${params.S3_BUCKET_NAME}/${params.S3_PREFIX}/${env.DOMAIN}/"
-                    echo "Certbot dir:  ${env.CERTBOT_DIR}"
+                    echo "Hosted zone:  ${env.HOSTED_ZONE_ID}"
+                    echo "S3 target:    s3://${env.S3_BUCKET_NAME}/{fullchain,privkey}.pem"
                 }
             }
         }
@@ -192,7 +200,7 @@ pipeline {
                         set -euo pipefail
                         . "${VENV_DIR}/bin/activate"
 
-                        MARKER_KEY="${S3_PREFIX}/_healthcheck/${BUILD_NUMBER}.txt"
+                        MARKER_KEY="_healthcheck/${BUILD_NUMBER}.txt"
                         echo "Checking s3:PutObject on s3://${S3_BUCKET_NAME}/${MARKER_KEY} ..."
                         echo "jenkins-certbot healthcheck $(date -u +%FT%TZ)" > /tmp/healthcheck.txt
                         aws s3 cp /tmp/healthcheck.txt "s3://${S3_BUCKET_NAME}/${MARKER_KEY}"
@@ -201,7 +209,7 @@ pipeline {
                         aws s3 cp "s3://${S3_BUCKET_NAME}/${MARKER_KEY}" /tmp/healthcheck-read.txt >/dev/null
                         rm -f /tmp/healthcheck.txt /tmp/healthcheck-read.txt
 
-                        echo "OK: S3 put/get verified. (Note: this IAM policy intentionally has no DeleteObject permission — add a lifecycle rule on the ${S3_PREFIX}/_healthcheck/ prefix to auto-expire these marker objects. See README.)"
+                        echo "OK: S3 put/get verified. (Note: this IAM policy intentionally has no DeleteObject permission — add a lifecycle rule on the _healthcheck/ prefix to auto-expire these marker objects. See README.)"
                     '''
                 }
             }
@@ -234,6 +242,11 @@ pipeline {
                             KEY_TYPE_ARGS="--key-type rsa --rsa-key-size 2048"
                         fi
 
+                        EMAIL_ARGS="--register-unsafely-without-email"
+                        if [ -n "${LETSENCRYPT_EMAIL}" ]; then
+                            EMAIL_ARGS="--email ${LETSENCRYPT_EMAIL}"
+                        fi
+
                         # certbot-dns-route53 auto-discovers the matching hosted zone (ListHostedZonesByName),
                         # creates the _acme-challenge TXT record (ChangeResourceRecordSets UPSERT), polls
                         # until it's INSYNC (GetChange), lets the CA validate it, then deletes the TXT
@@ -241,7 +254,8 @@ pipeline {
                         certbot certonly \
                             --non-interactive \
                             --agree-tos \
-                            --email "${LETSENCRYPT_EMAIL}" \
+                            --force-renewal \
+                            ${EMAIL_ARGS} \
                             --dns-route53 \
                             --dns-route53-propagation-seconds 30 \
                             --config-dir "${CERTBOT_DIR}/config" \
@@ -272,9 +286,9 @@ pipeline {
                         fi
                         chmod 600 "${LIVE_DIR}/privkey.pem"
 
-                        for f in fullchain.pem privkey.pem cert.pem chain.pem; do
+                        for f in fullchain.pem privkey.pem; do
                             echo "Uploading ${f} ..."
-                            aws s3 cp "${LIVE_DIR}/${f}" "s3://${S3_BUCKET_NAME}/${S3_PREFIX}/${DOMAIN}/${f}" --sse AES256
+                            aws s3 cp "${LIVE_DIR}/${f}" "s3://${S3_BUCKET_NAME}/${f}" --sse AES256
                         done
                     '''
                 }
@@ -289,7 +303,7 @@ pipeline {
             archiveArtifacts artifacts: '.certbot/**/logs/*.log', allowEmptyArchive: true, fingerprint: false
         }
         success {
-            echo "Certificate for ${env.DOMAIN} issued and uploaded to s3://${params.S3_BUCKET_NAME}/${params.S3_PREFIX}/${env.DOMAIN}/"
+            echo "Certificate for ${env.DOMAIN} issued and uploaded to s3://${env.S3_BUCKET_NAME}/{fullchain,privkey}.pem"
         }
         failure {
             echo "Pipeline failed — check the certbot log artifact and the failing AWS CLI call in the stage logs above."

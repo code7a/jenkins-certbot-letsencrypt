@@ -56,7 +56,7 @@ Resources:
       LifecycleConfiguration:
         Rules:
           - Id: expire-jenkins-certbot-healthchecks
-            Prefix: certificates/_healthcheck/
+            Prefix: _healthcheck/
             Status: Enabled
             ExpirationInDays: 1
       Tags:
