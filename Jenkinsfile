@@ -216,10 +216,16 @@ pipeline {
                         # creates the _acme-challenge TXT record (ChangeResourceRecordSets UPSERT), polls
                         # until it's INSYNC (GetChange), lets the CA validate it, then deletes the TXT
                         # record (ChangeResourceRecordSets DELETE) once validation completes.
+                        # --cert-name pins the live/ output directory to exactly ${DOMAIN}, regardless
+                        # of what SANs are requested. Without it, certbot auto-suffixes (-0001, -0002, ...)
+                        # whenever the requested domain set doesn't exactly match an existing lineage of
+                        # the same name (e.g. toggling INCLUDE_WILDCARD on/off between runs) — which would
+                        # silently break the Upload stage's LIVE_DIR path below.
                         certbot certonly \
                             --non-interactive \
                             --agree-tos \
                             --force-renewal \
+                            --cert-name "${DOMAIN}" \
                             ${EMAIL_ARGS} \
                             --dns-route53 \
                             --config-dir "${CERTBOT_DIR}/config" \
