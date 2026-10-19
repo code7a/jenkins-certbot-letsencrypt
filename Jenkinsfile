@@ -222,7 +222,6 @@ pipeline {
                             --force-renewal \
                             ${EMAIL_ARGS} \
                             --dns-route53 \
-                            --dns-route53-propagation-seconds 30 \
                             --config-dir "${CERTBOT_DIR}/config" \
                             --work-dir "${CERTBOT_DIR}/work" \
                             --logs-dir "${CERTBOT_DIR}/logs" \
