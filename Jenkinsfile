@@ -208,8 +208,8 @@ pipeline {
                         fi
 
                         EMAIL_ARGS="--register-unsafely-without-email"
-                        if [ -n "${LETSENCRYPT_EMAIL}" ]; then
-                            EMAIL_ARGS="--email ${LETSENCRYPT_EMAIL}"
+                        if [ -n "${LETSENCRYPT_EMAIL:-}" ]; then
+                            EMAIL_ARGS="--email ${LETSENCRYPT_EMAIL:-}"
                         fi
 
                         # certbot-dns-route53 auto-discovers the matching hosted zone (ListHostedZonesByName),
